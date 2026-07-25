@@ -1,0 +1,28 @@
+{
+  "name": "@ahp/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "echo \"(no linter configured for @ahp/core)\"",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx src/migrate.ts"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^0.10.4",
+    "drizzle-orm": "^0.36.4",
+    "uuid": "^11.0.3"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.28.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

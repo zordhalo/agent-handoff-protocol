@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+.next/
+.turbo/
+.vercel/
+*.tsbuildinfo
+.env
+.env.local
+.env*.local
+npm-debug.log*
+pnpm-debug.log*
+.DS_Store
+Thumbs.db
+coverage/

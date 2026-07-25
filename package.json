@@ -1,0 +1,26 @@
+{
+  "name": "agent-handoff-protocol",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Durable agent sessions: serialize, transfer, and meter a running agent's state across compute hosts.",
+  "license": "MIT",
+  "packageManager": "pnpm@10.27.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter=./packages/* build",
+    "typecheck": "pnpm -r --filter=./packages/* typecheck",
+    "lint": "pnpm -r --filter=./packages/* lint",
+    "demo": "tsx scripts/demo.ts",
+    "db:generate": "pnpm --filter @ahp/core db:generate",
+    "db:migrate": "pnpm --filter @ahp/core db:migrate"
+  },
+  "dependencies": {
+    "@ahp/core": "workspace:*"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
