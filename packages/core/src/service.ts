@@ -1,4 +1,4 @@
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "./client.js";
 import { transfers, budgets, usageEvents } from "./schema.js";
 import type {
@@ -23,27 +23,45 @@ import { TIER_LIMITS } from "./types.js";
 const GRACE_PERIOD_MS = 60_000;
 const STAGE_TTL_MS = 30 * 60_000;
 
+/** Thrown by requireTransfer when a transfer id doesn't exist — distinct
+ * from any other failure (network, connection, etc.) so callers can tell
+ * "not found" apart from "couldn't reach the database." */
+export class TransferNotFoundError extends Error {
+  constructor(transferId: string) {
+    super(`Transfer ${transferId} not found`);
+    this.name = "TransferNotFoundError";
+  }
+}
+
 export async function snapshotState(db: Db, input: SnapshotStateInput) {
-  const [transfer] = await db
-    .insert(transfers)
-    .values({
-      sourceHost: input.sourceHost,
-      systemPrompt: input.systemPrompt,
-      messageHistory: input.messageHistory,
-      toolState: input.toolState,
-      mcpConfig: input.mcpConfig,
-      status: "staged",
-    })
-    .returning();
+  // Generated client-side so the transfer row and its audit event can be
+  // written atomically in one batch (see provisionRuntime for why this
+  // matters: a torn write between the two here would leave a transfer with
+  // no snapshot_created event, harmless, but the pattern should be
+  // consistent everywhere it's cheap to make it so).
+  const id = crypto.randomUUID();
+
+  const [[transfer]] = await db.batch([
+    db
+      .insert(transfers)
+      .values({
+        id,
+        sourceHost: input.sourceHost,
+        systemPrompt: input.systemPrompt,
+        messageHistory: input.messageHistory,
+        toolState: input.toolState,
+        mcpConfig: input.mcpConfig,
+        status: "staged",
+      })
+      .returning(),
+    db.insert(usageEvents).values({
+      transferId: id,
+      eventType: "snapshot_created",
+      detail: { sourceHost: input.sourceHost, messageCount: input.messageHistory.length },
+    }),
+  ]);
 
   if (!transfer) throw new Error("snapshotState: insert returned no row");
-
-  await db.insert(usageEvents).values({
-    transferId: transfer.id,
-    eventType: "snapshot_created",
-    detail: { sourceHost: input.sourceHost, messageCount: input.messageHistory.length },
-  });
-
   return transfer;
 }
 
@@ -53,22 +71,27 @@ export async function provisionRuntime(db: Db, input: ProvisionRuntimeInput) {
     throw new Error(`provisionRuntime: transfer ${transfer.id} is '${transfer.status}', expected 'staged'`);
   }
 
-  await db
-    .update(transfers)
-    .set({ status: "provisioned", provisionedAt: new Date(), destinationTier: input.tier })
-    .where(eq(transfers.id, transfer.id));
-
-  await db.insert(budgets).values({
-    transferId: transfer.id,
-    allocatedUsd: input.allocatedUsd.toFixed(6),
-    ratePerHourUsd: input.ratePerHourUsd.toFixed(6),
-  });
-
-  await db.insert(usageEvents).values({
-    transferId: transfer.id,
-    eventType: "runtime_provisioned",
-    detail: { tier: input.tier, limits: TIER_LIMITS[input.tier as DestinationTier], allocatedUsd: input.allocatedUsd },
-  });
+  // Atomic: if any of these three writes fails, none of them land, and the
+  // transfer stays cleanly at 'staged' for a safe retry. Without this, a
+  // failure between the status update and the budget insert would wedge
+  // the transfer at 'provisioned' with no budget row and no way back to
+  // 'staged' (provisionRuntime's own precondition above forbids it).
+  await db.batch([
+    db
+      .update(transfers)
+      .set({ status: "provisioned", provisionedAt: new Date(), destinationTier: input.tier })
+      .where(eq(transfers.id, transfer.id)),
+    db.insert(budgets).values({
+      transferId: transfer.id,
+      allocatedUsd: input.allocatedUsd.toFixed(6),
+      ratePerHourUsd: input.ratePerHourUsd.toFixed(6),
+    }),
+    db.insert(usageEvents).values({
+      transferId: transfer.id,
+      eventType: "runtime_provisioned",
+      detail: { tier: input.tier, limits: TIER_LIMITS[input.tier as DestinationTier], allocatedUsd: input.allocatedUsd },
+    }),
+  ]);
 
   return requireTransfer(db, transfer.id);
 }
@@ -119,30 +142,54 @@ export async function reportUsage(db: Db, input: ReportUsageInput) {
     throw new Error(`reportUsage: transfer ${transfer.id} is '${transfer.status}', expected 'active'`);
   }
 
-  const [budget] = await db.select().from(budgets).where(eq(budgets.transferId, input.transferId));
-  if (!budget) throw new Error(`reportUsage: no budget row for transfer ${input.transferId}`);
+  const costUsd = input.costUsd.toFixed(6);
 
-  const newSpent = Number(budget.spentUsd) + input.costUsd;
-
-  await db
+  // Increment atomically in SQL (`spent_usd + costUsd`, both `numeric`)
+  // instead of SELECT-then-add-in-JS-then-write. Two prior review passes
+  // flagged the old version for two separate, compounding reasons: (a) a
+  // read-modify-write with no lock/transaction is a lost-update race under
+  // concurrent calls for the same transfer, and (b) doing the addition via
+  // `Number(...)` round-trips a currency total through a 64-bit float,
+  // exactly what the `numeric` column type exists to avoid. Letting
+  // Postgres do the arithmetic in one statement fixes both: it's a single
+  // atomic row update, and `numeric + numeric` in SQL is exact.
+  const [updatedBudget] = await db
     .update(budgets)
-    .set({ spentUsd: newSpent.toFixed(6), updatedAt: new Date() })
-    .where(eq(budgets.transferId, input.transferId));
+    .set({ spentUsd: sql`${budgets.spentUsd} + ${costUsd}`, updatedAt: new Date() })
+    .where(eq(budgets.transferId, input.transferId))
+    .returning();
+
+  if (!updatedBudget) throw new Error(`reportUsage: no budget row for transfer ${input.transferId}`);
 
   await db.insert(usageEvents).values({
     transferId: input.transferId,
     eventType: "heartbeat",
     detail: input.detail ?? {},
-    costUsd: input.costUsd.toFixed(6),
+    costUsd,
   });
 
-  if (newSpent >= Number(budget.allocatedUsd) && transfer.status === "active") {
-    await db.update(transfers).set({ status: "insolvent" }).where(eq(transfers.id, input.transferId));
-    await db.insert(usageEvents).values({
-      transferId: input.transferId,
-      eventType: "insolvent",
-      detail: { allocatedUsd: budget.allocatedUsd, spentUsd: newSpent, gracePeriodMs: GRACE_PERIOD_MS },
-    });
+  const isOverBudget = Number(updatedBudget.spentUsd) >= Number(updatedBudget.allocatedUsd);
+  if (isOverBudget) {
+    // Conditioned on status still being 'active' so two concurrent calls
+    // that both cross the threshold can't both "win" the transition and
+    // each insert their own insolvent event.
+    const [flipped] = await db
+      .update(transfers)
+      .set({ status: "insolvent" })
+      .where(and(eq(transfers.id, input.transferId), eq(transfers.status, "active")))
+      .returning();
+
+    if (flipped) {
+      await db.insert(usageEvents).values({
+        transferId: input.transferId,
+        eventType: "insolvent",
+        detail: {
+          allocatedUsd: updatedBudget.allocatedUsd,
+          spentUsd: updatedBudget.spentUsd,
+          gracePeriodMs: GRACE_PERIOD_MS,
+        },
+      });
+    }
   }
 
   return getStatus(db, input.transferId);
@@ -203,6 +250,6 @@ export async function reapExpiredTransfers(db: Db) {
 
 async function requireTransfer(db: Db, transferId: string) {
   const [transfer] = await db.select().from(transfers).where(eq(transfers.id, transferId));
-  if (!transfer) throw new Error(`Transfer ${transferId} not found`);
+  if (!transfer) throw new TransferNotFoundError(transferId);
   return transfer;
 }

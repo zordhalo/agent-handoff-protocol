@@ -1,0 +1,2 @@
+CREATE TYPE "public"."destination_tier" AS ENUM('sandbox-small', 'sandbox-medium', 'sandbox-large');--> statement-breakpoint
+ALTER TABLE "transfers" ALTER COLUMN "destination_tier" SET DATA TYPE destination_tier USING "destination_tier"::destination_tier;

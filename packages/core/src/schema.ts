@@ -8,6 +8,13 @@ import {
   pgEnum,
 } from "drizzle-orm/pg-core";
 
+// Single source of truth for the tier set, defined here (rather than
+// imported from ./types.ts) because drizzle-kit's config loader compiles
+// this file standalone and doesn't resolve same-package relative imports
+// the way a normal TS build does. types.ts imports DestinationTier back
+// from this file instead.
+export const DESTINATION_TIERS = ["sandbox-small", "sandbox-medium", "sandbox-large"] as const;
+
 /**
  * Lifecycle of a single handoff. "insolvent" is a distinct state from
  * "terminated": it marks the grace window after budget exhaustion, before
@@ -22,6 +29,7 @@ export const transferStatus = pgEnum("transfer_status", [
   "terminated",
   "expired",
 ]);
+export type TransferStatus = (typeof transferStatus.enumValues)[number];
 
 export const eventType = pgEnum("event_type", [
   "snapshot_created",
@@ -33,10 +41,15 @@ export const eventType = pgEnum("event_type", [
   "terminated",
 ]);
 
+// Kept as a pgEnum (rather than the plain `text` it was before) so
+// Postgres itself rejects an invalid tier, matching how `status` is
+// already enforced at the DB level, not just in application code.
+export const destinationTier = pgEnum("destination_tier", DESTINATION_TIERS);
+
 export const transfers = pgTable("transfers", {
   id: uuid("id").primaryKey().defaultRandom(),
   sourceHost: text("source_host").notNull(),
-  destinationTier: text("destination_tier"),
+  destinationTier: destinationTier("destination_tier"),
   status: transferStatus("status").notNull().default("staged"),
 
   // Serialized agent state. Credentials are never stored here directly —

@@ -10,6 +10,7 @@ import {
   activate,
   reportUsage,
   getStatus,
+  DESTINATION_TIERS,
 } from "@ahp/core";
 
 /**
@@ -27,7 +28,9 @@ const server = new McpServer({ name: "agent-handoff-protocol", version: "0.1.0" 
 
 const messageSchema = z.object({ role: z.string(), content: z.string() });
 const mcpConfigSchema = z.object({ server: z.string(), credRef: z.string() });
-const tierSchema = z.enum(["sandbox-small", "sandbox-medium", "sandbox-large"]);
+// Derived from @ahp/core's DESTINATION_TIERS rather than re-typed here, so
+// this can't silently drift from the tier set the service layer enforces.
+const tierSchema = z.enum(DESTINATION_TIERS);
 
 server.tool(
   "snapshot_state",

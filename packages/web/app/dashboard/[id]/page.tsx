@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { createDb, getStatus } from "@ahp/core";
+import { createDb, getStatus, TransferNotFoundError } from "@ahp/core";
 
 export const dynamic = "force-dynamic";
 
@@ -11,13 +11,37 @@ function fmtDate(d: Date | string | null) {
 
 export default async function TransferDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const db = createDb();
 
-  let status: Awaited<ReturnType<typeof getStatus>>;
+  let status: Awaited<ReturnType<typeof getStatus>> | null = null;
+  let error: string | null = null;
   try {
+    const db = createDb();
     status = await getStatus(db, id);
-  } catch {
-    notFound();
+  } catch (e) {
+    if (e instanceof TransferNotFoundError) notFound();
+    // Anything else (DB unreachable, missing DATABASE_URL, etc.) is a real
+    // infra problem, not "this transfer doesn't exist" — don't 404 it away.
+    console.error(`dashboard/[id]: failed to load transfer ${id}`, e);
+    error = e instanceof Error ? e.message : String(e);
+  }
+
+  if (error || !status) {
+    return (
+      <main>
+        <section>
+          <div className="wrap">
+            <Link href="/dashboard" style={{ color: "var(--text-dim)", fontSize: 13 }}>
+              ← all transfers
+            </Link>
+            <div className="empty-state">
+              Couldn&apos;t load this transfer ({error}). If you&apos;re running this locally,
+              make sure <code>DATABASE_URL</code> is set — see README.md → &quot;Database
+              setup&quot;.
+            </div>
+          </div>
+        </section>
+      </main>
+    );
   }
 
   const { transfer, budget, events } = status;
