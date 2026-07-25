@@ -7,6 +7,8 @@ state, transferring it to a provisioned sandbox on a different machine, and
 metering what it costs to keep running there — built as an MCP server over
 a Postgres-backed state machine.
 
+**Live:** [agent-handoff-protocol.vercel.app](https://agent-handoff-protocol.vercel.app) · [/dashboard](https://agent-handoff-protocol.vercel.app/dashboard) shows a real transfer, end to end, on a live Neon database.
+
 <p>
   <img alt="license" src="https://img.shields.io/badge/license-MIT-6ee7b7?style=flat-square">
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20-6ee7b7?style=flat-square">
