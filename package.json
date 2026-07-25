@@ -9,6 +9,7 @@
     "node": ">=20"
   },
   "scripts": {
+    "postinstall": "pnpm --filter @ahp/core build",
     "build": "pnpm -r --filter=./packages/* build",
     "typecheck": "pnpm -r --filter=./packages/* typecheck",
     "lint": "pnpm -r --filter=./packages/* lint",

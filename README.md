@@ -106,6 +106,7 @@ reimplementing the state machine three times.
 git clone https://github.com/zordhalo/agent-handoff-protocol
 cd agent-handoff-protocol
 pnpm install
+pnpm --filter @ahp/core build   # @ahp/core ships compiled (dist/ is gitignored); demo.ts and the web app both import it
 
 # Pull DATABASE_URL from the Vercel project's Neon integration
 vercel link

@@ -171,7 +171,8 @@ export default function Home() {
           <pre className="code-block">{`git clone https://github.com/zordhalo/agent-handoff-protocol
 cd agent-handoff-protocol
 pnpm install
-vercel env pull .env.local   # DATABASE_URL from the Neon integration
+pnpm --filter @ahp/core build   # dist/ is gitignored — build before demo.ts or the web app import it
+vercel env pull .env.local      # DATABASE_URL from the Neon integration
 pnpm db:migrate
 pnpm demo                    # runs a full lifecycle against your Neon DB
 pnpm --filter @ahp/web dev   # open /dashboard to watch it`}</pre>

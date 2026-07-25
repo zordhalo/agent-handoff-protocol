@@ -153,20 +153,27 @@ export async function reportUsage(db: Db, input: ReportUsageInput) {
   // exactly what the `numeric` column type exists to avoid. Letting
   // Postgres do the arithmetic in one statement fixes both: it's a single
   // atomic row update, and `numeric + numeric` in SQL is exact.
-  const [updatedBudget] = await db
-    .update(budgets)
-    .set({ spentUsd: sql`${budgets.spentUsd} + ${costUsd}`, updatedAt: new Date() })
-    .where(eq(budgets.transferId, input.transferId))
-    .returning();
+  // Batched with the heartbeat event insert so a spend can't land without
+  // the event that records it — a later review pass caught that the
+  // increment above stopped being idempotent once it became relative
+  // (`spent_usd + $1` instead of an absolute write), so an unbatched
+  // failure here would either lose the audit trail for real money or, on
+  // a naive retry, double-charge it.
+  const [[updatedBudget]] = await db.batch([
+    db
+      .update(budgets)
+      .set({ spentUsd: sql`${budgets.spentUsd} + ${costUsd}`, updatedAt: new Date() })
+      .where(eq(budgets.transferId, input.transferId))
+      .returning(),
+    db.insert(usageEvents).values({
+      transferId: input.transferId,
+      eventType: "heartbeat",
+      detail: input.detail ?? {},
+      costUsd,
+    }),
+  ]);
 
   if (!updatedBudget) throw new Error(`reportUsage: no budget row for transfer ${input.transferId}`);
-
-  await db.insert(usageEvents).values({
-    transferId: input.transferId,
-    eventType: "heartbeat",
-    detail: input.detail ?? {},
-    costUsd,
-  });
 
   const isOverBudget = Number(updatedBudget.spentUsd) >= Number(updatedBudget.allocatedUsd);
   if (isOverBudget) {
