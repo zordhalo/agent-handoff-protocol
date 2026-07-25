@@ -13,7 +13,13 @@ import {
   getStatus,
   computeSnapshotChecksum,
   issueTransferToken,
+  decodeTransferToken,
+  consumeTransferToken,
   getTransferTokenSecret,
+  reapExpiredTransfers,
+  reapInsolventTransfers,
+  GRACE_PERIOD_MS,
+  STAGE_TTL_MS,
   TransferNotFoundError,
   type Db,
 } from "../src/index.js";
@@ -123,7 +129,7 @@ describe("provisionRuntime", () => {
     ).rejects.toThrow(/malformed transfer token/);
   });
 
-  it("rejects a token scoped for a different transfer", async () => {
+  it("rejects a token scoped for a different transfer (wrong transferId, not a replay)", async () => {
     const a = await stageTransfer();
     const b = await stageTransfer();
     const tokenForB = issueTransferToken(b.id, "provision_runtime", tokenSecret);
@@ -137,7 +143,13 @@ describe("provisionRuntime", () => {
     ).rejects.toThrow(/not valid for provision_runtime/);
   });
 
-  it("rejects a token that's already been used (replay)", async () => {
+  it("rejects reusing the exact same token against the exact same transfer (a genuine replay)", async () => {
+    // Through provisionRuntime directly rather than consumeTransferToken,
+    // so this exercises the real call path, not just the unit underneath
+    // it. A prior version of this test reused a token across two different
+    // transferIds, which is rejected by the transferId check before the
+    // nonce insert (the single-use mechanism) is ever reached — this one
+    // isn't, since transferId and scope both match the second time too.
     const transfer = await stageTransfer();
     const token = issueTransferToken(transfer.id, "provision_runtime", tokenSecret);
 
@@ -147,16 +159,35 @@ describe("provisionRuntime", () => {
       tokenSecret,
     );
 
-    // Stage a fresh transfer at the right precondition so the replay is
-    // rejected by the token check, not the (also-correct) status guard.
-    const transfer2 = await stageTransfer();
+    await expect(consumeTransferToken(db, token, transfer.id, "provision_runtime", tokenSecret)).rejects.toThrow(
+      /already used/,
+    );
+  });
+
+  it("rejects a token signed with a different secret", async () => {
+    const transfer = await stageTransfer();
+    const tokenFromWrongSecret = issueTransferToken(transfer.id, "provision_runtime", "not-the-real-secret");
+
     await expect(
       provisionRuntime(
         db,
-        { transferId: transfer2.id, tier: "sandbox-small", allocatedUsd: 1, ratePerHourUsd: 0.1, token },
+        {
+          transferId: transfer.id,
+          tier: "sandbox-small",
+          allocatedUsd: 1,
+          ratePerHourUsd: 0.1,
+          token: tokenFromWrongSecret,
+        },
         tokenSecret,
       ),
-    ).rejects.toThrow(/not valid for provision_runtime/); // wrong transferId anyway
+    ).rejects.toThrow(/invalid transfer token signature/);
+  });
+
+  it("rejects an expired token", async () => {
+    const transfer = await stageTransfer();
+    const expiredToken = issueTransferToken(transfer.id, "provision_runtime", tokenSecret, -1);
+
+    expect(() => decodeTransferToken(expiredToken, tokenSecret)).toThrow(/expired/);
   });
 });
 
@@ -257,5 +288,86 @@ describe("terminate / getStatus", () => {
 
   it("throws TransferNotFoundError, not a generic error, for an unknown id", async () => {
     await expect(getStatus(db, randomUUID())).rejects.toBeInstanceOf(TransferNotFoundError);
+  });
+});
+
+describe("reapExpiredTransfers", () => {
+  it("expires a staged transfer past STAGE_TTL_MS", async () => {
+    const transfer = await stageTransfer();
+    await db
+      .update(transfers)
+      .set({ createdAt: new Date(Date.now() - STAGE_TTL_MS - 1000) })
+      .where(eq(transfers.id, transfer.id));
+
+    const count = await reapExpiredTransfers(db);
+    expect(count).toBeGreaterThanOrEqual(1);
+
+    const status = await getStatus(db, transfer.id);
+    expect(status.transfer.status).toBe("expired");
+  });
+
+  it("does not touch a staged transfer within STAGE_TTL_MS", async () => {
+    const transfer = await stageTransfer();
+    await reapExpiredTransfers(db);
+
+    const status = await getStatus(db, transfer.id);
+    expect(status.transfer.status).toBe("staged");
+  });
+
+  it("does not touch an active transfer even if it's old (the TOCTOU case a review pass flagged)", async () => {
+    const transfer = await stageTransfer();
+    await provisionTransfer(transfer.id);
+    await pushState(db, transfer.id);
+    await activateTransfer(transfer.id);
+
+    // Backdate createdAt past the TTL to simulate a transfer that took a
+    // long time to reach 'active' — reapExpiredTransfers must not touch it
+    // since its WHERE clause only matches staged/provisioned/pushed.
+    await db
+      .update(transfers)
+      .set({ createdAt: new Date(Date.now() - STAGE_TTL_MS - 1000) })
+      .where(eq(transfers.id, transfer.id));
+
+    await reapExpiredTransfers(db);
+
+    const status = await getStatus(db, transfer.id);
+    expect(status.transfer.status).toBe("active");
+  });
+});
+
+describe("reapInsolventTransfers", () => {
+  async function insolventTransfer() {
+    const transfer = await stageTransfer();
+    await provisionTransfer(transfer.id, { allocatedUsd: 1.0 });
+    await pushState(db, transfer.id);
+    await activateTransfer(transfer.id);
+    const status = await reportUsage(db, { transferId: transfer.id, costUsd: 1.5 });
+    expect(status.transfer.status).toBe("insolvent");
+    return transfer;
+  }
+
+  it("terminates a transfer that's been insolvent past GRACE_PERIOD_MS", async () => {
+    const transfer = await insolventTransfer();
+    await db
+      .update(transfers)
+      .set({ insolventAt: new Date(Date.now() - GRACE_PERIOD_MS - 1000) })
+      .where(eq(transfers.id, transfer.id));
+
+    const count = await reapInsolventTransfers(db);
+    expect(count).toBeGreaterThanOrEqual(1);
+
+    const status = await getStatus(db, transfer.id);
+    expect(status.transfer.status).toBe("terminated");
+    expect(status.transfer.terminationReason).toBe("grace_period_expired");
+    expect(status.events.some((e) => e.eventType === "terminated")).toBe(true);
+  });
+
+  it("does not touch a transfer still within its grace period", async () => {
+    const transfer = await insolventTransfer();
+
+    await reapInsolventTransfers(db);
+
+    const status = await getStatus(db, transfer.id);
+    expect(status.transfer.status).toBe("insolvent");
   });
 });

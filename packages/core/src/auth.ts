@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import type { Db } from "./client.js";
 import { usedTransferTokens } from "./schema.js";
 
@@ -48,7 +48,7 @@ export function issueTransferToken(
   const payload: TransferTokenPayload = {
     transferId,
     scope,
-    nonce: crypto.randomUUID(),
+    nonce: randomUUID(),
     exp: Date.now() + ttlMs,
   };
   const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
@@ -100,9 +100,17 @@ export async function consumeTransferToken(
       scope,
     });
   } catch (err) {
-    // Postgres unique_violation on the nonce primary key means this exact
-    // token was already consumed once.
-    throw new Error(`transfer token already used: ${err instanceof Error ? err.message : String(err)}`);
+    // Only a Postgres unique_violation (SQLSTATE 23505) on the nonce
+    // primary key means "already used" — anything else (an un-migrated
+    // used_transfer_tokens table, a dropped connection, an FK violation)
+    // is a genuinely different failure and must not be reported as a
+    // replay, which would send an operator chasing a nonexistent token
+    // reuse instead of the real problem (e.g. a missing migration).
+    const code = (err as { code?: unknown } | null)?.code;
+    if (code === "23505") {
+      throw new Error(`transfer token already used (nonce ${payload.nonce})`);
+    }
+    throw err;
   }
 }
 

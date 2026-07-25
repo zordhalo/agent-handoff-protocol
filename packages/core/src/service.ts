@@ -22,8 +22,10 @@ import { consumeTransferToken } from "./auth.js";
  * never activated within its TTL — see reapExpiredTransfers().
  */
 
-const GRACE_PERIOD_MS = 60_000;
-const STAGE_TTL_MS = 30 * 60_000;
+// Exported (not module-private) so the test suite can construct
+// past-cutoff timestamps directly rather than waiting out real time.
+export const GRACE_PERIOD_MS = 60_000;
+export const STAGE_TTL_MS = 30 * 60_000;
 
 /** Thrown by requireTransfer when a transfer id doesn't exist — distinct
  * from any other failure (network, connection, etc.) so callers can tell
@@ -77,13 +79,15 @@ export async function snapshotState(db: Db, input: SnapshotStateInput) {
  * Auth-gated per docs/ROADMAP.md Phase 1 item 4: `input.token` must be a
  * valid, unexpired, unused token minted by `issueTransferToken` for this
  * exact transferId and the 'provision_runtime' scope. Token consumption is
- * a separate write from the atomic batch below by necessity (it has to
- * happen-before the precondition check means anything), so a failure in
- * the batch after a valid token is consumed does burn that token — the
- * caller needs a fresh one to retry. Documented tradeoff, not an oversight:
- * the alternative (checking the token without recording it as used until
- * the whole operation succeeds) would reopen the replay window the token
- * exists to close.
+ * currently a separate write from the atomic batch below, not the batch's
+ * first statement — this is a simplification, not a hard constraint (the
+ * nonce insert could join the same db.batch() call to make token-burn and
+ * the state change atomic together), so a failure in the batch after a
+ * valid token is consumed does burn that token today — the caller needs a
+ * fresh one to retry. That's a safe failure mode (a caller can always
+ * request a new token) rather than a security gap, since the replay
+ * protection itself stays intact either way; it's flagged here as a
+ * possible follow-up, not something to treat as settled.
  */
 export async function provisionRuntime(db: Db, input: ProvisionRuntimeInput, tokenSecret: string) {
   const transfer = await requireTransfer(db, input.transferId);
@@ -156,6 +160,14 @@ export async function pushState(db: Db, transferId: string, expectedChecksum?: s
  * optimistically. See docs/DESIGN.md §2 ("activate is the only irreversible
  * step"). Auth-gated the same way as provisionRuntime — see that
  * function's docstring for the token-consumption tradeoff.
+ *
+ * The status-changing UPDATE re-checks `status = 'pushed'` in its own WHERE
+ * clause rather than trusting the read above: single-use token consumption
+ * alone doesn't stop two concurrent activate calls if the orchestrator
+ * (mistakenly or otherwise) issued two distinct valid tokens for the same
+ * transfer — each has its own nonce, so both would pass consumeTransferToken.
+ * Without this guard both could write status:'active' and each insert their
+ * own 'activated' event for what's supposed to be the one irreversible step.
  */
 export async function activate(db: Db, transferId: string, token: string, tokenSecret: string) {
   const transfer = await requireTransfer(db, transferId);
@@ -165,7 +177,15 @@ export async function activate(db: Db, transferId: string, token: string, tokenS
 
   await consumeTransferToken(db, token, transferId, "activate", tokenSecret);
 
-  await db.update(transfers).set({ status: "active", activatedAt: new Date() }).where(eq(transfers.id, transferId));
+  const [activated] = await db
+    .update(transfers)
+    .set({ status: "active", activatedAt: new Date() })
+    .where(and(eq(transfers.id, transferId), eq(transfers.status, "pushed")))
+    .returning();
+
+  if (!activated) {
+    throw new Error(`activate: transfer ${transferId} lost a concurrent race to another activate/transition`);
+  }
 
   await db.insert(usageEvents).values({
     transferId,
@@ -173,7 +193,7 @@ export async function activate(db: Db, transferId: string, token: string, tokenS
     detail: {},
   });
 
-  return requireTransfer(db, transferId);
+  return activated;
 }
 
 export async function reportUsage(db: Db, input: ReportUsageInput) {
@@ -283,18 +303,24 @@ export async function listRecentEvents(db: Db, limit = 50) {
  * packages/web/app/api/cron/reap/route.ts (docs/ROADMAP.md Phase 1 item 3).
  * Distinct mechanism from reapInsolventTransfers below — this one has no
  * awareness of `insolvent` rows.
+ *
+ * A single UPDATE with the status/age check in its own WHERE clause, not a
+ * SELECT followed by per-row UPDATEs — a review pass caught that the
+ * earlier SELECT-then-loop version had a TOCTOU gap where a transfer could
+ * legitimately `activate` between the SELECT and its UPDATE and still get
+ * stamped `expired` out from under an active session. Folding the
+ * precondition into the UPDATE's WHERE clause means Postgres re-evaluates
+ * it per row at write time, closing that gap the same way `reportUsage`'s
+ * `and(eq(id,...), eq(status,'active'))` guard already does.
  */
 export async function reapExpiredTransfers(db: Db) {
   const cutoff = new Date(Date.now() - STAGE_TTL_MS);
-  const stale = await db
-    .select()
-    .from(transfers)
-    .where(sql`${transfers.status} in ('staged','provisioned','pushed') and ${transfers.createdAt} < ${cutoff}`);
-
-  for (const transfer of stale) {
-    await db.update(transfers).set({ status: "expired" }).where(eq(transfers.id, transfer.id));
-  }
-  return stale.length;
+  const expired = await db
+    .update(transfers)
+    .set({ status: "expired" })
+    .where(sql`${transfers.status} in ('staged','provisioned','pushed') and ${transfers.createdAt} < ${cutoff}`)
+    .returning({ id: transfers.id });
+  return expired.length;
 }
 
 /**
@@ -303,18 +329,31 @@ export async function reapExpiredTransfers(db: Db) {
  * nothing ever enforced: transfers that have been 'insolvent' for longer
  * than the grace period get torn down. Called by the same cron route as
  * reapExpiredTransfers, on the same schedule.
+ *
+ * Same atomic-UPDATE-with-guard shape as reapExpiredTransfers, for the same
+ * reason. Doesn't call terminate() — that function has no status
+ * precondition of its own (by design, so a human can force-terminate from
+ * any state), which is exactly the unguarded shape this function needs to
+ * avoid for its automated sweep.
  */
 export async function reapInsolventTransfers(db: Db) {
   const cutoff = new Date(Date.now() - GRACE_PERIOD_MS);
-  const overdue = await db
-    .select()
-    .from(transfers)
-    .where(sql`${transfers.status} = 'insolvent' and ${transfers.insolventAt} < ${cutoff}`);
+  const reaped = await db
+    .update(transfers)
+    .set({ status: "terminated", terminatedAt: new Date(), terminationReason: "grace_period_expired" })
+    .where(sql`${transfers.status} = 'insolvent' and ${transfers.insolventAt} < ${cutoff}`)
+    .returning({ id: transfers.id });
 
-  for (const transfer of overdue) {
-    await terminate(db, transfer.id, "grace_period_expired");
+  if (reaped.length > 0) {
+    await db.insert(usageEvents).values(
+      reaped.map((t) => ({
+        transferId: t.id,
+        eventType: "terminated" as const,
+        detail: { reason: "grace_period_expired" },
+      })),
+    );
   }
-  return overdue.length;
+  return reaped.length;
 }
 
 async function requireTransfer(db: Db, transferId: string) {
