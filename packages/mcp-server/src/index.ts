@@ -11,6 +11,7 @@ import {
   reportUsage,
   getStatus,
   DESTINATION_TIERS,
+  getTransferTokenSecret,
 } from "@ahp/core";
 
 /**
@@ -21,9 +22,17 @@ import {
  * "consent". Whether a transfer happens is a decision made by whoever
  * calls provision_runtime/activate — a human, a script, a scheduler — never
  * something inferred from model output. See docs/DESIGN.md §2.
+ *
+ * Also absent, deliberately: no tool here mints a transfer-auth token.
+ * `provision_runtime` and `activate` both require one (docs/ROADMAP.md
+ * Phase 1 item 4), but issuance (`issueTransferToken`, exported from
+ * @ahp/core) is a plain function for an orchestrator to call directly —
+ * never exposed as something this MCP server, and therefore the agent
+ * connected to it, can invoke.
  */
 
 const db = createDb();
+const tokenSecret = getTransferTokenSecret();
 const server = new McpServer({ name: "agent-handoff-protocol", version: "0.1.0" });
 
 const messageSchema = z.object({ role: z.string(), content: z.string() });
@@ -50,35 +59,42 @@ server.tool(
 
 server.tool(
   "provision_runtime",
-  "Request a sandboxed destination runtime sized to `tier`, with a fixed compute budget. Does not move any state yet.",
+  "Request a sandboxed destination runtime sized to `tier`, with a fixed compute budget. Does not move any state yet. Requires a transfer-authorization token minted out-of-band by the orchestrator (this server has no tool to mint one).",
   {
     transferId: z.string().uuid(),
     tier: tierSchema,
     allocatedUsd: z.number().positive(),
     ratePerHourUsd: z.number().positive(),
+    token: z.string().describe("Transfer-authorization token for scope 'provision_runtime', minted by the orchestrator"),
   },
   async (input) => {
-    const transfer = await provisionRuntime(db, input);
+    const transfer = await provisionRuntime(db, input, tokenSecret);
     return textResult({ transfer_id: transfer.id, status: transfer.status, tier: transfer.destinationTier });
   },
 );
 
 server.tool(
   "push_state",
-  "Upload the previously created snapshot to the provisioned destination's staging area.",
-  { transferId: z.string().uuid() },
-  async ({ transferId }) => {
-    const transfer = await pushState(db, transferId);
+  "Upload the previously created snapshot to the provisioned destination's staging area. If expectedChecksum is provided, it's verified against the checksum snapshot_state computed and stored.",
+  {
+    transferId: z.string().uuid(),
+    expectedChecksum: z.string().optional(),
+  },
+  async ({ transferId, expectedChecksum }) => {
+    const transfer = await pushState(db, transferId, expectedChecksum);
     return textResult({ transfer_id: transfer.id, status: transfer.status });
   },
 );
 
 server.tool(
   "activate",
-  "Boot the destination runtime from the staged snapshot. This is the only irreversible step in the protocol — the caller must confirm success here before terminating the source loop.",
-  { transferId: z.string().uuid() },
-  async ({ transferId }) => {
-    const transfer = await activate(db, transferId);
+  "Boot the destination runtime from the staged snapshot. This is the only irreversible step in the protocol — the caller must confirm success here before terminating the source loop. Requires a transfer-authorization token minted out-of-band by the orchestrator, scoped to 'activate'.",
+  {
+    transferId: z.string().uuid(),
+    token: z.string().describe("Transfer-authorization token for scope 'activate', minted by the orchestrator"),
+  },
+  async ({ transferId, token }) => {
+    const transfer = await activate(db, transferId, token, tokenSecret);
     return textResult({ transfer_id: transfer.id, status: transfer.status, activatedAt: transfer.activatedAt });
   },
 );

@@ -138,17 +138,17 @@ export default function Home() {
               <tr>
                 <td className="mono">provision_runtime</td>
                 <td>orchestrator (human- or script-initiated)</td>
-                <td>Sizes a sandbox, sets the budget</td>
+                <td>Requires an auth token; sizes a sandbox, sets the budget</td>
               </tr>
               <tr>
                 <td className="mono">push_state</td>
                 <td>orchestrator</td>
-                <td>Uploads snapshot to destination staging</td>
+                <td>Uploads snapshot to destination staging; verifies checksum</td>
               </tr>
               <tr>
                 <td className="mono">activate</td>
                 <td>orchestrator</td>
-                <td>Boots destination; only irreversible step</td>
+                <td>Requires an auth token; boots destination; only irreversible step</td>
               </tr>
               <tr>
                 <td className="mono">report_usage</td>

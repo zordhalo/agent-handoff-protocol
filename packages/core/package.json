@@ -12,17 +12,18 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "echo \"(no linter configured for @ahp/core)\"",
+    "test": "vitest run",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx src/migrate.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",
-    "drizzle-orm": "^0.36.4",
-    "uuid": "^11.0.3"
+    "drizzle-orm": "^0.36.4"
   },
   "devDependencies": {
     "drizzle-kit": "^0.28.1",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
   }
 }

@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.27.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build @ahp/core
+        run: pnpm --filter @ahp/core build
+
+      - name: Typecheck @ahp/mcp-server
+        run: pnpm --filter @ahp/mcp-server typecheck
+
+      - name: Build @ahp/web
+        run: pnpm --filter @ahp/web build
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TRANSFER_TOKEN_SECRET: ${{ secrets.TRANSFER_TOKEN_SECRET }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+
+      # Integration tests against the real Neon dev database (see
+      # packages/core/vitest.config.ts for why — the neon-http driver has
+      # no local-container equivalent). Every test cleans up the rows it
+      # creates, so this is safe to run against the same DB the demo/
+      # dashboard use.
+      - name: Test @ahp/core
+        run: pnpm --filter @ahp/core test
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TRANSFER_TOKEN_SECRET: ${{ secrets.TRANSFER_TOKEN_SECRET }}

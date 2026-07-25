@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "./client.js";
 import { transfers, budgets, usageEvents } from "./schema.js";
@@ -8,6 +9,7 @@ import type {
   DestinationTier,
 } from "./types.js";
 import { TIER_LIMITS } from "./types.js";
+import { consumeTransferToken } from "./auth.js";
 
 /**
  * Service layer behind every MCP tool. Kept framework-agnostic (no MCP
@@ -33,6 +35,10 @@ export class TransferNotFoundError extends Error {
   }
 }
 
+export function computeSnapshotChecksum(messageHistory: SnapshotStateInput["messageHistory"]): string {
+  return createHash("sha256").update(JSON.stringify(messageHistory)).digest("hex");
+}
+
 export async function snapshotState(db: Db, input: SnapshotStateInput) {
   // Generated client-side so the transfer row and its audit event can be
   // written atomically in one batch (see provisionRuntime for why this
@@ -40,6 +46,7 @@ export async function snapshotState(db: Db, input: SnapshotStateInput) {
   // no snapshot_created event, harmless, but the pattern should be
   // consistent everywhere it's cheap to make it so).
   const id = crypto.randomUUID();
+  const snapshotChecksum = computeSnapshotChecksum(input.messageHistory);
 
   const [[transfer]] = await db.batch([
     db
@@ -52,6 +59,7 @@ export async function snapshotState(db: Db, input: SnapshotStateInput) {
         toolState: input.toolState,
         mcpConfig: input.mcpConfig,
         status: "staged",
+        snapshotChecksum,
       })
       .returning(),
     db.insert(usageEvents).values({
@@ -65,17 +73,32 @@ export async function snapshotState(db: Db, input: SnapshotStateInput) {
   return transfer;
 }
 
-export async function provisionRuntime(db: Db, input: ProvisionRuntimeInput) {
+/**
+ * Auth-gated per docs/ROADMAP.md Phase 1 item 4: `input.token` must be a
+ * valid, unexpired, unused token minted by `issueTransferToken` for this
+ * exact transferId and the 'provision_runtime' scope. Token consumption is
+ * a separate write from the atomic batch below by necessity (it has to
+ * happen-before the precondition check means anything), so a failure in
+ * the batch after a valid token is consumed does burn that token — the
+ * caller needs a fresh one to retry. Documented tradeoff, not an oversight:
+ * the alternative (checking the token without recording it as used until
+ * the whole operation succeeds) would reopen the replay window the token
+ * exists to close.
+ */
+export async function provisionRuntime(db: Db, input: ProvisionRuntimeInput, tokenSecret: string) {
   const transfer = await requireTransfer(db, input.transferId);
   if (transfer.status !== "staged") {
     throw new Error(`provisionRuntime: transfer ${transfer.id} is '${transfer.status}', expected 'staged'`);
   }
 
+  await consumeTransferToken(db, input.token, input.transferId, "provision_runtime", tokenSecret);
+
   // Atomic: if any of these three writes fails, none of them land, and the
-  // transfer stays cleanly at 'staged' for a safe retry. Without this, a
-  // failure between the status update and the budget insert would wedge
-  // the transfer at 'provisioned' with no budget row and no way back to
-  // 'staged' (provisionRuntime's own precondition above forbids it).
+  // transfer stays cleanly at 'staged' for a safe retry (modulo the burned
+  // token above). Without this, a failure between the status update and
+  // the budget insert would wedge the transfer at 'provisioned' with no
+  // budget row and no way back to 'staged' (provisionRuntime's own
+  // precondition above forbids it).
   await db.batch([
     db
       .update(transfers)
@@ -96,10 +119,24 @@ export async function provisionRuntime(db: Db, input: ProvisionRuntimeInput) {
   return requireTransfer(db, transfer.id);
 }
 
-export async function pushState(db: Db, transferId: string) {
+/**
+ * `expectedChecksum`, if provided, must match the checksum snapshotState
+ * computed and stored — a lightweight integrity check standing in for
+ * real destination-side verification (see docs/ROADMAP.md Phase 1 item 5).
+ * Omitting it skips the check, which is fine for now since nothing outside
+ * this database is actually receiving the snapshot yet; Phase 2's real
+ * transfer should make this required.
+ */
+export async function pushState(db: Db, transferId: string, expectedChecksum?: string) {
   const transfer = await requireTransfer(db, transferId);
   if (transfer.status !== "provisioned") {
     throw new Error(`pushState: transfer ${transfer.id} is '${transfer.status}', expected 'provisioned'`);
+  }
+
+  if (expectedChecksum !== undefined && expectedChecksum !== transfer.snapshotChecksum) {
+    throw new Error(
+      `pushState: checksum mismatch for transfer ${transferId} — snapshot may have been altered in transit`,
+    );
   }
 
   await db.update(transfers).set({ status: "pushed", pushedAt: new Date() }).where(eq(transfers.id, transferId));
@@ -117,13 +154,16 @@ export async function pushState(db: Db, transferId: string) {
  * Irreversible step. Callers (the MCP server, the demo script) must only
  * terminate the source loop after this resolves successfully — never
  * optimistically. See docs/DESIGN.md §2 ("activate is the only irreversible
- * step").
+ * step"). Auth-gated the same way as provisionRuntime — see that
+ * function's docstring for the token-consumption tradeoff.
  */
-export async function activate(db: Db, transferId: string) {
+export async function activate(db: Db, transferId: string, token: string, tokenSecret: string) {
   const transfer = await requireTransfer(db, transferId);
   if (transfer.status !== "pushed") {
     throw new Error(`activate: transfer ${transfer.id} is '${transfer.status}', expected 'pushed'`);
   }
+
+  await consumeTransferToken(db, token, transferId, "activate", tokenSecret);
 
   await db.update(transfers).set({ status: "active", activatedAt: new Date() }).where(eq(transfers.id, transferId));
 
@@ -182,7 +222,7 @@ export async function reportUsage(db: Db, input: ReportUsageInput) {
     // each insert their own insolvent event.
     const [flipped] = await db
       .update(transfers)
-      .set({ status: "insolvent" })
+      .set({ status: "insolvent", insolventAt: new Date() })
       .where(and(eq(transfers.id, input.transferId), eq(transfers.status, "active")))
       .returning();
 
@@ -239,8 +279,10 @@ export async function listRecentEvents(db: Db, limit = 50) {
 
 /**
  * Sweeps transfers that were staged/provisioned/pushed but never activated
- * within STAGE_TTL_MS. Meant to be invoked periodically (e.g. Vercel Cron)
- * — not wired to a cron job in this showcase, but the logic is real.
+ * within STAGE_TTL_MS. Invoked periodically by the Vercel Cron route at
+ * packages/web/app/api/cron/reap/route.ts (docs/ROADMAP.md Phase 1 item 3).
+ * Distinct mechanism from reapInsolventTransfers below — this one has no
+ * awareness of `insolvent` rows.
  */
 export async function reapExpiredTransfers(db: Db) {
   const cutoff = new Date(Date.now() - STAGE_TTL_MS);
@@ -253,6 +295,26 @@ export async function reapExpiredTransfers(db: Db) {
     await db.update(transfers).set({ status: "expired" }).where(eq(transfers.id, transfer.id));
   }
   return stale.length;
+}
+
+/**
+ * Completes the insolvent -> terminated transition that GRACE_PERIOD_MS
+ * was always meant to gate but, until docs/ROADMAP.md Phase 1 item 3,
+ * nothing ever enforced: transfers that have been 'insolvent' for longer
+ * than the grace period get torn down. Called by the same cron route as
+ * reapExpiredTransfers, on the same schedule.
+ */
+export async function reapInsolventTransfers(db: Db) {
+  const cutoff = new Date(Date.now() - GRACE_PERIOD_MS);
+  const overdue = await db
+    .select()
+    .from(transfers)
+    .where(sql`${transfers.status} = 'insolvent' and ${transfers.insolventAt} < ${cutoff}`);
+
+  for (const transfer of overdue) {
+    await terminate(db, transfer.id, "grace_period_expired");
+  }
+  return overdue.length;
 }
 
 async function requireTransfer(db: Db, transferId: string) {

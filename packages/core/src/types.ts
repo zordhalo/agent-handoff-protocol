@@ -27,6 +27,8 @@ export interface ProvisionRuntimeInput {
   tier: DestinationTier;
   allocatedUsd: number;
   ratePerHourUsd: number;
+  /** Minted by the orchestrator via issueTransferToken — never by the source loop. See auth.ts. */
+  token: string;
 }
 
 export interface ReportUsageInput {

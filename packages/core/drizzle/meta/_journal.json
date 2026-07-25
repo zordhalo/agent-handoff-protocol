@@ -15,6 +15,13 @@
       "when": 1785001146865,
       "tag": "0001_yummy_ozymandias",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1785005009930,
+      "tag": "0002_even_lady_bullseye",
+      "breakpoints": true
     }
   ]
 }

@@ -60,10 +60,21 @@ export const transfers = pgTable("transfers", {
   toolState: jsonb("tool_state").notNull().default({}),
   mcpConfig: jsonb("mcp_config").notNull().default([]),
 
+  // SHA-256 of the staged messageHistory, set by snapshotState and checked
+  // by pushState against a caller-supplied checksum — a lightweight
+  // integrity check standing in for real destination-side verification
+  // until Phase 2's real sandbox transfer exists. See docs/ROADMAP.md
+  // Phase 1 item 5.
+  snapshotChecksum: text("snapshot_checksum").notNull(),
+
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   provisionedAt: timestamp("provisioned_at", { withTimezone: true }),
   pushedAt: timestamp("pushed_at", { withTimezone: true }),
   activatedAt: timestamp("activated_at", { withTimezone: true }),
+  // Set when reportUsage flips a transfer to 'insolvent' — the grace-period
+  // sweep (reapInsolventTransfers) uses this, not budgets.updatedAt, to
+  // decide when GRACE_PERIOD_MS has elapsed.
+  insolventAt: timestamp("insolvent_at", { withTimezone: true }),
   terminatedAt: timestamp("terminated_at", { withTimezone: true }),
   terminationReason: text("termination_reason"),
 });
@@ -87,4 +98,17 @@ export const usageEvents = pgTable("usage_events", {
   detail: jsonb("detail").notNull().default({}),
   costUsd: numeric("cost_usd", { precision: 12, scale: 6 }).notNull().default("0"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// Replay protection for transfer-authorization tokens (see ./auth.ts). A
+// token's nonce gets inserted here the first time it's successfully used;
+// the insert's primary-key collision on a second attempt IS the "already
+// used" check — no separate read-then-write race to get wrong.
+export const usedTransferTokens = pgTable("used_transfer_tokens", {
+  nonce: uuid("nonce").primaryKey(),
+  transferId: uuid("transfer_id")
+    .notNull()
+    .references(() => transfers.id, { onDelete: "cascade" }),
+  scope: text("scope").notNull(),
+  usedAt: timestamp("used_at", { withTimezone: true }).notNull().defaultNow(),
 });

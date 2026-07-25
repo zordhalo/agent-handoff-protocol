@@ -8,6 +8,9 @@ import {
   reportUsage,
   terminate,
   getStatus,
+  computeSnapshotChecksum,
+  issueTransferToken,
+  getTransferTokenSecret,
 } from "@ahp/core";
 
 // Load a local .env / .env.local if present (e.g. after `vercel env pull`).
@@ -24,9 +27,15 @@ for (const file of [".env.local", ".env"]) {
  * The "agent" here is a stand-in: a long-running inventory-forecasting loop
  * that outgrows its original host and gets hopped to a dedicated sandbox.
  * Swap the snapshot payload for real session state to use this for real.
+ *
+ * This script plays the orchestrator role for provision_runtime/activate's
+ * transfer-auth tokens (docs/ROADMAP.md Phase 1 item 4) — it calls
+ * issueTransferToken directly, the same way a human-operated control plane
+ * would, never the source loop itself.
  */
 
 const db = createDb();
+const tokenSecret = getTransferTokenSecret();
 
 function log(step: string, detail: unknown) {
   console.log(`\n[${step}]`);
@@ -47,18 +56,26 @@ async function main() {
   });
   log("snapshot_state", { transferId: snapshot.id, status: snapshot.status });
 
-  const provisioned = await provisionRuntime(db, {
-    transferId: snapshot.id,
-    tier: "sandbox-medium",
-    allocatedUsd: 2.0,
-    ratePerHourUsd: 0.25,
-  });
+  const provisionToken = issueTransferToken(snapshot.id, "provision_runtime", tokenSecret);
+  const provisioned = await provisionRuntime(
+    db,
+    {
+      transferId: snapshot.id,
+      tier: "sandbox-medium",
+      allocatedUsd: 2.0,
+      ratePerHourUsd: 0.25,
+      token: provisionToken,
+    },
+    tokenSecret,
+  );
   log("provision_runtime", { status: provisioned.status, tier: provisioned.destinationTier });
 
-  const pushed = await pushState(db, snapshot.id);
-  log("push_state", { status: pushed.status });
+  const expectedChecksum = computeSnapshotChecksum(snapshot.messageHistory as Array<{ role: string; content: string }>);
+  const pushed = await pushState(db, snapshot.id, expectedChecksum);
+  log("push_state", { status: pushed.status, checksumVerified: true });
 
-  const activated = await activate(db, snapshot.id);
+  const activateToken = issueTransferToken(snapshot.id, "activate", tokenSecret);
+  const activated = await activate(db, snapshot.id, activateToken, tokenSecret);
   log("activate", { status: activated.status, activatedAt: activated.activatedAt });
 
   // Simulate the destination sandbox's metering daemon reporting spend
@@ -81,6 +98,11 @@ async function main() {
   }
 
   if (status.transfer.status === "insolvent") {
+    // Terminating immediately here for a fast demo. In a real deployment
+    // this is optional — the grace-period cron sweep
+    // (reapInsolventTransfers, wired to /api/cron/reap) auto-terminates
+    // any transfer still insolvent after GRACE_PERIOD_MS even if nothing
+    // calls terminate directly.
     const terminated = await terminate(db, snapshot.id, "budget_exhausted");
     log("terminate", { status: terminated.status, reason: terminated.terminationReason });
   }
