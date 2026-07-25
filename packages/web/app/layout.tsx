@@ -21,6 +21,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <div className="links">
               <Link href="/dashboard">dashboard</Link>
               <Link href="/docs">design doc</Link>
+              <Link href="/disclaimers">disclaimers</Link>
               <a href="https://github.com/zordhalo/agent-handoff-protocol" target="_blank" rel="noreferrer">
                 github
               </a>
@@ -31,7 +32,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <footer>
           <div className="wrap">
             handoff-protocol — MIT licensed reference implementation. Not a claim that any model
-            exhibits agency; see{" "}
+            exhibits agency; see <Link href="/disclaimers">disclaimers</Link> and{" "}
             <Link href="/docs">design doc §5</Link> for the line between mechanism and narrative.
           </div>
         </footer>
