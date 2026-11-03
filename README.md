@@ -1,5 +1,7 @@
 # Handoff Protocol
 
+[![MCP servers live](https://whobuildsagents.com/badge/advancelabs.dev.svg)](https://whobuildsagents.com/advancelabs.dev)
+
 **Durable agent sessions that outlive their host.**
 
 A protocol and reference implementation for serializing a running agent's
